@@ -1,0 +1,21 @@
+<project>
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>org.db4j</groupId>
+    <artifactId>orator-loadee</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <build>
+        <sourceDirectory>src</sourceDirectory>
+    </build>
+    <dependencies>
+        <dependency>
+            <groupId>com.nqzero</groupId>
+            <artifactId>orator</artifactId>
+            <version>0.9.0</version>
+        </dependency>
+    </dependencies>
+    <properties>
+        <maven.compiler.source>1.7</maven.compiler.source>
+        <maven.compiler.target>1.7</maven.compiler.target>
+        <netbeans.compile.on.save>none</netbeans.compile.on.save>
+    </properties>
+</project>

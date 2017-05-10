@@ -10,7 +10,7 @@
         <dependency>
             <groupId>com.nqzero</groupId>
             <artifactId>orator</artifactId>
-            <version>0.9.0</version>
+            <version>0.9.1</version>
         </dependency>
     </dependencies>
     <properties>

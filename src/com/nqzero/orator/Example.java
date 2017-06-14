@@ -137,17 +137,23 @@ public class Example {
             int idpos = buffer.position();
             if (writeIDs)
                 writeClassAndObject(buffer, my.getClassIDs() );
-            if (pool != null) { pool.release(this); pool = null; }
+            unpool();
             return idpos;
         }
         public MyKryo pool(KryoPool $pool) { pool = $pool; return this; }
         KryoPool pool;
+        public void unpool() {
+            if (pool != null) {
+                pool.release(this);
+                pool = null;
+            }
+        }
 
         public Object get(Input buffer) {
             clearContext();
             Object obj;
             obj = readClassAndObject( buffer );
-            if (pool != null) { pool.release(this); pool = null; }
+            unpool();
             return obj;
         }
         public int [] getIDs(Input buffer,int idpos) {

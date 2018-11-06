@@ -574,7 +574,7 @@ public class Orator {
         public Lock lock;
         public LockingQ.LockSet lockset;
         public LockingQ<Message.User> userq;
-        public LockingQ<Message.Admin> defineq;
+        public LockingQ<Message.Memo> defineq;
 
         public BossLoop init() {
             delegateq = new LinkedBlockingQueue();
@@ -625,7 +625,7 @@ public class Orator {
                 try {
                     waitNotEmpty();
                     Message.User user;
-                    Message.Admin admin;
+                    Message.Memo admin;
                     need.size = 0;
                     while ( ( user = userq.poll() ) != null ) {
                         user.getIDs( orator );

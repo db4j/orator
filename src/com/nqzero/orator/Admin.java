@@ -15,8 +15,8 @@ public abstract class Admin implements Adminable {
     public transient OratorUtils.Nest nest;
 
     /** thread-safe. scratch is used to construct the message, but no reference to it is kept */
-    public Message.Admin wrap(Output scratch,Example.MyKryo kryo) {
-        Message.Admin msg = new Message.Admin().set( this, scratch, kryo );
+    public Message.Memo wrap(Output scratch,Example.MyKryo kryo) {
+        Message.Memo msg = new Message.Memo().set( this, scratch, kryo );
         msg.nest = nest;
         return msg;
     }

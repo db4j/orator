@@ -12,7 +12,7 @@ import java.nio.ByteBuffer;
 public abstract class Message {
 
     public static Class [] classList = new Class [] {
-        User.class, Admin.class, Sup.class, Sub.class, Composite.class, Printer.class, Task.class,
+        User.class, Memo.class, Sup.class, Sub.class, Composite.class, Printer.class, Task.class,
         Ack.class, TaskBase.class, TaskReply.class
     };
     public static int tracking = 0;
@@ -190,7 +190,7 @@ public abstract class Message {
         }
     }
 
-    public static class Admin extends Flat<Admin,Adminable> {
+    public static class Memo extends Flat<Memo,Adminable> {
         { header += 0; }
 
         public void get(Orator orator) {

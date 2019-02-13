@@ -11,8 +11,25 @@
     </parent>
     <build>
         <sourceDirectory>src</sourceDirectory>
+    <plugins>
+      <plugin>
+          <groupId>org.db4j</groupId>
+          <artifactId>kilim</artifactId>
+          <version>2.0.1</version>
+          <executions>
+              <execution>
+                  <goals><goal>weave</goal></goals>
+              </execution>
+          </executions>
+      </plugin>
+    </plugins>
     </build>
     <dependencies>
+        <dependency>
+            <groupId>org.ow2.asm</groupId>
+            <artifactId>asm</artifactId>
+            <version>7.0</version>
+        </dependency>
         <dependency>
             <groupId>com.esotericsoftware</groupId>
             <artifactId>kryo</artifactId>
@@ -33,6 +50,11 @@
             <groupId>org.db4j</groupId>
             <artifactId>reflectasm</artifactId>
             <version>1.11.4-2</version>
+        </dependency>
+        <dependency>
+            <groupId>org.db4j</groupId>
+            <artifactId>kilim</artifactId>
+            <version>2.0.1</version>
         </dependency>
     </dependencies>
     <properties>

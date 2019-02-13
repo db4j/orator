@@ -2,11 +2,10 @@
 
 package com.nqzero.orator;
 
-import com.esotericsoftware.kryo.io.Output;
-import com.nqzero.orator.Orator.NetClass;
+import com.nqzero.orator.OratorUtils.Logable;
+import com.nqzero.orator.OratorUtils.NetClass;
 import java.io.InputStream;
 import java.lang.reflect.Constructor;
-import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.concurrent.BlockingQueue;
@@ -17,7 +16,12 @@ import org.srlutils.DynArray;
 import org.srlutils.Files;
 
 public class Loader {
-    public static boolean dbg = false;
+    
+    public interface Oratorable {
+        Logable logger();
+        void sendMessage(Message msg) throws InterruptedException;
+        void assertBoss();
+    }
 
     public static class NetLoader extends ClassLoader {
         public boolean dbg = true;
@@ -26,8 +30,8 @@ public class Loader {
         /** a non-definitive set of requested class names - could leave requests in the set after definition
          *    or fail to indicate a requested item. Note: iteration may fail
          */
-        final HashSet<String> requests = new HashSet();
-        public Orator orator;
+        ConcurrentHashMap.KeySetView<String,Boolean> requests = ConcurrentHashMap.newKeySet();
+        public Oratorable orator;
         /**
          * the upstream nest to use for requesting class bytecode
          * the nest.kelly isn't used for serialization
@@ -35,67 +39,73 @@ public class Loader {
         public OratorUtils.Nest upstream;
 
         
-        public NetLoader(Orator orator) { super( NetLoader.class.getClassLoader() ); this.orator = orator; }
+        public NetLoader(Oratorable orator) { super( NetLoader.class.getClassLoader() ); this.orator = orator; }
         public NetLoader init(OratorUtils.Nest upstream) {
             this.upstream = upstream;
             return this;
         }
+        synchronized
         public Class<?> defineClass(NetClass nc) {
-            orator.logger.log( "NetLoader::define,%d -- %8d --> %40s --> %8d bytes\n",
-                    upstream.kelly.id, nc.classID, nc.name, nc.code.length );
+            orator.logger().log("NetLoader::define,%s,%d -- %-40s,%8d,%8d bytes",
+                    hashCode(), upstream.kelly.id, nc.name, nc.classID, nc.code.length);
             Class klass = null;
             klass = defineClass( nc.name, nc.code, 0, nc.code.length );
             codeMap.put( nc.name, nc.code );
-            synchronized( requests ) { requests.remove( nc.name ); }
+            requests.remove(nc.name);
             return klass;
         }
         public Class<?> loadClass(String name,boolean resolve) throws ClassNotFoundException {
             return loadClass( name, resolve, true );
         }
+        
+        void slurp() throws InterruptedException {
+            Admin.ReplyCode reply = codeq.take();
+            for (NetClass nc : reply.klasses)
+                if (nc != null) defineClass(nc);
+        }
 
+        synchronized
         public Class<?> loadClass(String name,boolean resolve,boolean useNet) throws ClassNotFoundException {
+            Integer tid = OratorUtils.threadID.get();
             Class klass = null;
-            try { klass = super.loadClass( name, false ); } catch (ClassNotFoundException ex) {}
-            if (klass == null && useNet) {
-                Output buf = new Output(new byte[2048]);
-                Admin.ReqCode admin = new Admin.ReqCode().set( name );
-                admin.nest = upstream;
-                admin.msgID = 1;
-                orator.check();
-                Message msg = admin.wrap( buf, orator.kryo2() ); // user loop, down
-                try {
-                    orator.send.sendq.put( msg );
-                    do {
-                        // fixme:race-condition -- another task could trigger addCode()
-                        Admin.ReplyCode reply = codeq.take();
-                        for (NetClass nc : reply.klasses)
-                            if (nc != null) defineClass(nc);
-                        klass = findLoadedClass( name );
-                        orator.logger.log( "NetLoader::useNet,%d -- waiting for %s --> %s\n",
-                                upstream.kelly.id, name, klass );
-                    } while ( klass == null );
-                } catch (InterruptedException ex) {
-                    throw new RuntimeException( "NetLoader::useNet - interupted" );
+            try {
+                while (useNet && ! codeq.isEmpty())
+                    slurp();
+                try { klass = super.loadClass( name, false ); } catch (ClassNotFoundException ex) {}
+                if (klass == null && useNet) {
+                    if (tid != null && tid==1)
+                        throw new RuntimeException("Orator.Loader.badThread: " + tid + ", " + name);
+                    Message msg = Admin.ReqCode.make(upstream,name);
+                    orator.sendMessage(msg);
+                    while (klass==null) {
+                        if (codeq.isEmpty())
+                            orator.logger().log("NetLoader::slurp ,%s,%d -- %s",hashCode(),upstream.kelly.id,name);
+                        slurp();
+                        klass = findLoadedClass(name);
+                    }
                 }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException( "NetLoader::useNet - interupted" );
             }
-            if (resolve) resolveClass( klass );
+            if (resolve) resolveClass(klass);
             return klass;
         }
 
         public boolean requested(String name) {
-            synchronized( requests ) { return requests.add( name ); }
+            return requests.add( name );
         }
 
         byte[] getBytecode(String name) {
             // fixme::completeness -- should handle delegation to the upstream ...
             return codeMap.get( name );
         }
+        /** return the class with binary name name if it is loaded, else null */
+        public Class<?> checkClass(String name) {
+            try { return Class.forName(name,false,this); } catch (Exception ex) { return null; }
+        }
     }
 
-    /** return the class with binary name name if it is loaded, else null */
-    public static Class<?> checkClass(String name) {
-        try { return Class.forName( name ); } catch (Exception ex) { return null; }
-    }
 
 
 
@@ -113,11 +123,21 @@ public class Loader {
             for (Class klass : klasses) skipMap.add( klass.getName() );
         }
 
+        public static void cmpout(java.util.Collection map, Object key) {
+            StringBuilder txt = new StringBuilder();
+            txt.append( String.format( "cmp searching for key %s\n", key ) );
+            for (Object kk : map) {
+                txt.append( String.format( "cmp: %5b -- %s\n", key.equals( kk ), kk ) );
+            }
+            System.out.println( txt );
+        }
 
+        private boolean dbg;
         public Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
             if ( skip.matcher( name ).matches() || skipMap.contains( name ) )
                 return super.loadClass( name, resolve );
-            if (false) Orator.cmpout( skipMap, name );
+            if (dbg)
+                cmpout(skipMap,name);
             Class klass;
             synchronized (map) { klass = map.get( name ); }
             if (klass == null) {
@@ -131,7 +151,7 @@ public class Loader {
             }
             if (dbg) System.out.format( "Loader::klass %50s --> %s\n",
                                 klass == nullClass ? null : klass.getClassLoader(), name );
-            if (klass == nullClass) throw new ClassNotFoundException();
+            if (klass == nullClass) throw new ClassNotFoundException(name);
             if (resolve) super.resolveClass( klass );
             return klass;
         }

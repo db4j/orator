@@ -2,11 +2,11 @@
 
 package loadee;
 
-import com.esotericsoftware.kryo.io.Output;
 import com.nqzero.orator.Orator;
-import com.nqzero.orator.Orator.Taskable;
+import com.nqzero.orator.DemoOrator;
+import com.nqzero.orator.OratorUtils.Taskable;
 import com.nqzero.orator.OratorUtils;
-import java.nio.ByteBuffer;
+import kilim.Mailbox;
 
 public class Obama {
 
@@ -18,32 +18,46 @@ public class Obama {
     
     public static class Dummy implements Taskable<String> {
         public String dummy = "yes we can";
-        public String task(Orator.Scoper xx) {
-            OratorUtils.Kelly kelly = xx.msg.nest.kelly;
-            xx.logger.log( "task,%d: %s --> %s, %s\n",
-                    kelly.id, this, dummy, this.getClass().getClassLoader() );
+        public String task() {
             Biden biden = new Biden();
-            int cnt = 0;
-            cnt = xx.orator.virus.count.incrementAndGet();
-            xx.logger.log( "task,%d: result: %s, count:%d", kelly.id, biden, cnt );
             String ret = String.format( "Obama::stdout:%d -- result: %s, count:%d",
-                    kelly.id, biden, cnt );
+                    0, biden, 0);
             System.out.println( ret );
             return ret;
         }
     }
 
+    static User user = new User("hello","world");
+    public static class User {
+        public String name, bio;
+        public User() {}
+        public User(String name,String bio) { this.name=name; this.bio=bio; }
+        public String toString() { return "user: " + name + " <" + bio + ">"; }
+    }    
+    public static class Dummy2 implements Taskable<User> {
+        public User task() {
+            User user = Obama.user;
+            System.out.println("task.getter.user: " + user);
+            return user;
+        }
+    }
 
     public static void main(String [] args) throws Exception {
+        if (kilim.tools.Kilim.trampoline(false,args))
+            return;
 
-        Orator net = new Orator().init( 0 );
-        net.start();
+        Orator net = new Orator();
+        net.init(0);
 
-        Output buf = new Output(new byte[2048]);
-        net.sendTask(new Dummy(), net.nestify(net.root, null, Orator.defaultPort), buf, new Orator.V3C());
+        OratorUtils.Remote roa = net.remotify(new OratorUtils.Remote().set(null,0).inet,DemoOrator.defaultPort);
+        OratorUtils.Nest root = net.nestify(net.root,roa);
+        for (int ii=0; ii < 20; ii++) {
+            Mailbox box = net.sendTask(new Dummy2(),root);
 
-        org.srlutils.Simple.sleep( 3000 );
-        net.diag();
+            Object result = box.getb();
+            System.out.println("result: " + result);
+        }
+        System.exit(0);
     }
 }
 

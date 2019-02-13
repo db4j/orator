@@ -2,21 +2,44 @@
 
 package com.nqzero.orator;
 
-import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.Registration;
-import com.esotericsoftware.kryo.pool.KryoFactory;
-import com.esotericsoftware.kryo.pool.KryoPool;
+import com.nqzero.orator.Orator.MetaActor;
 import com.nqzero.orator.Loader.NetLoader;
-import com.nqzero.orator.Orator.Logable;
-import com.nqzero.orator.Orator.NetClass;
+import com.nqzero.orator.Loader.Oratorable;
+import com.nqzero.orator.Message.MessageUtils;
+import java.io.Serializable;
 import java.net.DatagramPacket;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Objects;
+import kilim.Pausable;
 import org.srlutils.DynArray;
 
 public class OratorUtils {
+    public static ThreadLocal<Integer> threadID = new ThreadLocal();
+
+    public static void assertBoss(Integer desired) {
+        Integer tid = OratorUtils.threadID.get();
+        if (desired != null && desired.equals(tid) || desired==tid);
+        else
+            throw new RuntimeException("Kelly.thread.mismatch");
+    }
+    public interface Logable {
+        void log(String fmt,Object... args);
+    }
+    public static class NetClass {
+        public String name;
+        public int classID;
+        public byte [] code;
+
+        public NetClass set(Class klass) { name = klass.getName(); return this; }
+    }
+    public interface Taskable<TT> {
+        public abstract TT task() throws Pausable;
+    }
+
     public static class Multi {
         public Message msg;
         public int offset;
@@ -47,7 +70,7 @@ public class OratorUtils {
         }
     }
     public static class MessageSet {
-        public Orator orator;
+        public MessageUtils mutils;
         public int header;
         public static int compositeHeaderSize = new Message.Composite().header;
         int maxSize = 1024, size;
@@ -56,8 +79,8 @@ public class OratorUtils {
         DynArray.Objects<Message> list = new DynArray.Objects().init( Message.class );
         Nest.Key key;
         public MessageSet() {}
-        public MessageSet set(Orator orator,int header,Nest.Key key) {
-            this.orator = orator;
+        public MessageSet set(MessageUtils mutils,int header,Nest.Key key) {
+            this.mutils = mutils;
             this.key = key;
             this.header = header;
             return this;
@@ -82,7 +105,7 @@ public class OratorUtils {
         public Message toMessage() {
             Message msg = list.size == 1
                     ? list.vo[ 0 ]
-                    : orator.mutils.prep( new Message.Composite().set( list.trim() ) );
+                    : mutils.prep( new Message.Composite().set( list.trim() ) );
             init();
             return msg;
         }
@@ -154,7 +177,8 @@ public class OratorUtils {
     }
     public static class MultiBuffer {
         public DynArray.bytes data = new DynArray.bytes();
-        public int sum, total;
+        public int sum;
+        public int total;
         public boolean add(ByteBuffer buf,int offset,int length,int msgTotal) {
             if (msgTotal > 0) total = msgTotal;
             data.ensure( Math.max( offset+length, total ) );
@@ -179,12 +203,11 @@ public class OratorUtils {
         public Example.MyKryo kryo;
         /** 0 --> never tested, 1 --> requested name, 2 --> present, 3 --> requested bytecode */
         public DynArray.ints have;
-        public Orator orator;
+        public Oratorable orator;
         public int id;
-        public Logable logger;
         public Key key;
         /** list of user messages that have been deferred, not thread safe - owned by the boss loop */
-        public NakedList<Message.User> deferred = new NakedList();
+        public NakedList<MetaActor> deferred = new NakedList();
         public Kelly() {}
 
         /** roa is used only if not upstream */
@@ -195,14 +218,7 @@ public class OratorUtils {
             key.roa = roa;
             return this;
         }
-
-        KryoFactory factory = new KryoFactory() {
-            public Kryo create() { return kryo.dup(); }
-        };
-
-        KryoPool pool = new KryoPool.Builder(factory).build();
-        public Example.MyKryo kryo() { return ((Example.MyKryo) pool.borrow()).pool(pool); }
-
+        
         public void assertUpstream(boolean status) {
             boolean up = loader==null;
             if (up != status)
@@ -213,40 +229,38 @@ public class OratorUtils {
          * initialize the Kelly for god-mode, ie the most top-level authority. null values are shown
          *    explicitly, since they're part of the "API"
          */
-        public Kelly init(Orator orator) {
-            id = orator.kellyID++;
+        public Kelly init(int id,Oratorable orator) {
+            this.id = id;
             loader = null;
             have = null;
             kryo = null;
             this.orator = orator;
-            keyify( id, true, null );
+            keyify(id,true,null );
             return this;
         }
         /** initialize the Kelly with an upstream */
-        public Kelly init(Orator orator,Nest upstream,Logable logger) {
-            id = orator.kellyID++;
+        public Kelly init(int id,Oratorable orator,Nest upstream) {
+            this.id = id;
             loader = new NetLoader( orator ).init( upstream );
-            kryo = new Example.MyKryo().init();
+            kryo = new Example.MyKryo(true).init();
             have = new DynArray.ints();
             this.orator = orator;
-            this.logger = logger;
             return this;
         }
-        public void assertBoss() {
-            org.srlutils.Simple.hardAssert( Thread.currentThread(), orator.boss.thread, null );
-        }
         public void regID(Class klass,NetClass nc) {
-            assertBoss();
+            assertBoss(2);
             assertUpstream(false);
-            kryo.register( klass, nc.classID ); // boss down
-            have.set( nc.classID, 2 );
+            // fixme - move getDefaultSerializer to sched, ie non-blocking
+            kryo.register(klass, kryo.getDefaultSerializer(klass), nc.classID);
+            kryo.resolver.getRegistration(int.class);
+            have.set(nc.classID,2);
         }
         /** define the class if defined, return whether we need to request bytecode, and mark the have cache */
-        public boolean checkClass(NetClass nc) {
-            assertBoss();
+        public boolean registerIfReady(NetClass nc) {
+            assertBoss(2);
             int haveit = nc.classID < have.size ? have.get( nc.classID ) : 0;
             if (haveit <= 1) {
-                Class klass = Loader.checkClass( nc.name );
+                Class klass = loader.checkClass( nc.name );
                 if ( klass != null ) regID( klass, nc );
                 else {
                     have.set( nc.classID, 3 );
@@ -257,9 +271,15 @@ public class OratorUtils {
         }
         public void addCode(NetClass nc) {
             assertUpstream(false);
-            assertBoss();
-            Class klass = loader.defineClass( nc );
-            regID( klass, nc );
+            assertBoss(2);
+            try {
+                Class klass = loader.loadClass(nc.name);
+                if (nc.classID != 0)
+                    regID( klass, nc );
+            }
+            catch (ClassNotFoundException ex) {
+                throw new RuntimeException("classes should have been previously loaded",ex);
+            }
         }
         /**
          * verify that all classes needed to deserialize user are registered with kryo
@@ -267,8 +287,7 @@ public class OratorUtils {
          *   if user is deserializable add it to delegateq, otherwise to deferq
          */
         public boolean checkIDs(Message.User user,DynArray.ints needs) {
-            assertBoss();
-            // fixme:clarity -- this method is pretty simple, but it looks confusing, ifs buried in ifs
+            assertBoss(2);
             if (have == null) return true;
             // long-term should prolly support reverse-net-class-loading
             // but for now, require all classes to be available on the upstream
@@ -281,7 +300,7 @@ public class OratorUtils {
                 int cur = cid < have.size ? have.get( cid ) : 0;
                 if ( cur == 0 ) {
                     // boss down
-                    Registration rc = user.nest.kelly.kryo.getRegistration(cid);
+                    Registration rc = kryo.getRegistration(cid);
                     if (rc == null) { have.set( cid, 1 ); if (doAdd) needs.add( cid ); }
                     else            { have.set( cid, 2 );                    cur = 2; }
                 }
@@ -300,7 +319,7 @@ public class OratorUtils {
                 Key oo = (Key) obj;
                 return kid==oo.kid && up==oo.up && ( up || roa==oo.roa );
             }
-            public int hashCode() { return autoCode( kid, up ? 1 : roa.hashCode() ); }
+            public int hashCode() { return autoCode(3,31,kid,up ? 1 : roa.hashCode()); }
             public String toString() { return "Partner::Lookup::" + kid + "/" + (up ? "" : roa); }
         }
     }
@@ -314,7 +333,7 @@ public class OratorUtils {
             SupidKey oo = (SupidKey) obj;
             return roa==oo.roa && supID==oo.supID;
         }
-        public int hashCode() { return autoCode( supID, roa.hashCode() ); }
+        public int hashCode() { return autoCode(7,63,supID,roa.hashCode()); }
         public String toString() { return "SupidKey::" + roa + "/" + supID; }
     }
 
@@ -337,7 +356,7 @@ public class OratorUtils {
             Nest ref = Nest.this;
             @SuppressWarnings("EqualsWhichDoesntCheckParameterClass")
             public boolean equals(Object obj) { Nest oo = ((Nest.Key) obj).ref; return kelly==oo.kelly && roa==oo.roa; }
-            public int hashCode() { return kelly.hashCode()*67 + roa.hashCode(); }
+            public int hashCode() { return autoCode(11,127,kelly.hashCode(),roa.hashCode()); }
         }
     }
 
@@ -350,7 +369,7 @@ public class OratorUtils {
 
         @SuppressWarnings( { "EqualsWhichDoesntCheckParameterClass" })
         public boolean equals(Object obj) { Kiss2 oo = (Kiss2) obj; return nest == oo.nest && id == oo.id; }
-        public int hashCode() { return 67 * nest.hashCode() + id; }
+        public int hashCode() { return autoCode(13,255,nest.hashCode(),id); }
     }
 
     /**
@@ -368,6 +387,7 @@ public class OratorUtils {
             this.port = port;
             return this;
         }
+
         public String txtInfo() { return "" + inet + "/" + port; }
         public static class Key extends Remote {
             @SuppressWarnings("EqualsWhichDoesntCheckParameterClass")
@@ -375,32 +395,17 @@ public class OratorUtils {
                 Remote oo = (Remote) obj;
                 return port == oo.port && inet.equals( oo.inet );
             }
-            public int hashCode() { return inet.hashCode()*67 + port; }
+            public int hashCode() { return autoCode(17,511,inet.hashCode(),port); }
         }
     }
 
 
-    public static int autoCode(int v1) { int hash = 3; hash = 67*hash + v1; return hash; }
-    public static int autoCode(int v1,int v2) {
-        int hash = 3;
-        hash = 67*hash + v1;
-        hash = 67*hash + v2;
+    public static int autoCode(int offset,int gain,int v1,int v2) {
+        int hash = offset;
+        hash = gain*hash + v1;
+        hash = gain*hash + v2;
         return hash;
     }
-    public static int autoCode(int v1,int v2,int v3) {
-        int hash = 3;
-        hash = 67*hash + v1;
-        hash = 67*hash + v2;
-        hash = 67*hash + v3;
-        return hash;
-    }
-    public static int autoCode(int ... vals) {
-        int hash = 3;
-        for (int ii = 0; ii < vals.length; ii++)
-            hash = 67 * hash + vals[ ii ];
-        return hash;
-    }
-
 
 
     /**
@@ -446,8 +451,7 @@ public class OratorUtils {
         }
 
     }
-    public static void main(String [] args) throws Exception {
-        Orator.main( "stuff" );
+    public static void main(String[] args) {
+        DemoOrator.main(new String[] {"both"});
     }
-
 }

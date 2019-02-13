@@ -15,12 +15,15 @@ import com.esotericsoftware.kryo.pool.KryoFactory;
 import com.esotericsoftware.kryo.pool.KryoPool;
 import com.esotericsoftware.kryo.serializers.ClosureSerializer;
 import com.esotericsoftware.kryo.util.DefaultClassResolver;
+import com.esotericsoftware.kryo.util.IntMap;
 import com.esotericsoftware.kryo.util.MapReferenceResolver;
+import com.nqzero.orator.OratorUtils.NetClass;
 import java.io.Serializable;
 import java.util.HashSet;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.objenesis.strategy.StdInstantiatorStrategy;
+import org.srlutils.DynArray;
 
 public class Example {
 
@@ -86,6 +89,7 @@ public class Example {
         MyContext my = new MyContext();
         final ClassResolver resolver;
         final private MyKryo master;
+        boolean useName;
 
         protected MyKryo(SubResolver $resolver,ReferenceResolver referenceResolver,MyKryo $master) {
             super($resolver,referenceResolver);
@@ -106,9 +110,14 @@ public class Example {
         }
 
         public MyKryo() {
+            this(false);
+        }
+        public MyKryo(boolean useName) {
             super(new Resolver(),new MapReferenceResolver());
             resolver = (Resolver) getClassResolver();
             master = this;
+            this.useName = useName;
+            setAutoReset(false);
         }
 
         public void printTypes() {
@@ -130,6 +139,10 @@ public class Example {
             registeredClass = getRegistration(type);
             my.klasses.add( registeredClass.getId());
         }
+        NetClass [] getNamedClasses() {
+            return ((Resolver) resolver).namedClasses();
+        }
+
 
 	public int put(Output buffer, Object object, boolean writeIDs) {
             clearContext();
@@ -193,7 +206,8 @@ public class Example {
 
     public static class Resolver extends DefaultClassResolver {
 	public synchronized Registration registerImplicit(Class type) {
-            return kryo.register(type);
+            MyKryo my = (MyKryo) kryo;
+            return my.useName ? super.registerImplicit(type) : kryo.register(type);
 	}
         public Registration writeClass(Output output,Class type) {
             ((MyKryo) kryo).trackClass(type);
@@ -201,9 +215,21 @@ public class Example {
         }
         // super impl only resets name-based structures - save the lock and skip it
         // already impl dependent
-        public void reset() {}
+        public synchronized void reset() { super.reset(); }
         public synchronized Registration getRegistration(int classID) { return super.getRegistration(classID); }
         public synchronized Registration getRegistration(Class type) { return super.getRegistration(type); }
+        NetClass [] namedClasses() {
+            if (nameIdToClass==null || nameIdToClass.size==0) return null;
+            DynArray.Objects<NetClass> need = new DynArray.Objects().init(NetClass.class);
+            for (Class klass : nameIdToClass.values()) {
+                NetClass nc = new NetClass();
+                Registration reg = getRegistration(klass);
+                nc.classID = reg.getId();
+                nc.set(reg.getType());
+                need.add(nc);
+            }
+            return need.trim();
+        }
     }
     public static class SubResolver extends DefaultClassResolver {
         private final ClassResolver proxy;

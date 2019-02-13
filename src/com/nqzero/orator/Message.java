@@ -4,16 +4,17 @@ package com.nqzero.orator;
 
 import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
-import com.nqzero.orator.Orator.Adminable;
-import com.nqzero.orator.Orator.Taskable;
+import com.nqzero.orator.OratorUtils.Taskable;
 import com.nqzero.orator.OratorUtils.SupidKey;
 import java.nio.ByteBuffer;
+import java.util.HashMap;
+import org.srlutils.DynArray;
 
 public abstract class Message {
 
     public static Class [] classList = new Class [] {
-        User.class, Memo.class, Sup.class, Sub.class, Composite.class, Printer.class, Task.class,
-        Ack.class, TaskBase.class, TaskReply.class
+        User.class, Memo.class, Sup.class, Sub.class, Composite.class,
+        Ack.class, TaskReply.class, Task.class
     };
     public static int tracking = 0;
     
@@ -21,14 +22,12 @@ public abstract class Message {
     int header, type, id, track;
     public int core, size;
     public OratorUtils.Nest nest;
-    public Orator.Callback cb;
     public boolean reqAck = true;
     public void write(ByteBuffer buf) {
         buf.putInt( type );
     }
     public abstract void handle(Orator orator,ByteBuffer buf,int limit,boolean copy);
 
-    public Message cb(Orator.Callback cb) { this.cb = cb; return this; }
 
     public Message() {
         track = tracking++;
@@ -57,10 +56,15 @@ public abstract class Message {
         }
 
         /** create the message by serializing obj, using kryo and the scratch pad */
-        public TT set(UU obj,Output scratch,Example.MyKryo kryo) {
+        public TT set(UU obj) {
             payload = obj;
+            return (TT) this;
+        }
+
+        /** create the message by serializing obj, using kryo and the scratch pad */
+        public TT set(Output scratch,Example.MyKryo kryo) {
             scratch.clear();
-            int idpos = kryo.put( scratch, obj, true );
+            int idpos = kryo.put( scratch, payload, true );
             byte [] data2 = scratch.toBytes();
             return set( data2, idpos );
         }
@@ -80,6 +84,9 @@ public abstract class Message {
         }
         public void read(ByteBuffer buf) {}
         public void handle(Orator orator,ByteBuffer buf,int limit,boolean copy) {
+            prep(buf,limit,copy);
+        }
+        public void prep(ByteBuffer buf,int limit,boolean copy) {
             idOffset = buf.getInt();
             read( buf );
             if (!copy) {
@@ -98,15 +105,8 @@ public abstract class Message {
             }
             mark = buffer.position();
         }
-        public void getIDs(Orator orator) {
-            // fixme:race-condition - if downstream needs to register a class during kryo serialization of
-            //   a reply, should request that the upstream does it first and send the ids
-            //   eg, use name based resolving, keep a list, include the list in the reply
-            //       and upstream sends the ids back
-            // boss loop, down+up(TaskReply)
-            // could skip on up
-            orator.boss.check();
-            classIDs = orator.boss.kryo.getIDs(buffer(), mark + idOffset);
+        public void getIDs(Example.MyKryo kryo) {
+            classIDs = kryo.getIDs(buffer(), mark + idOffset);
         }
         public String txt() {
             return "Flat:" + (payload==null ? "null" : payload.toString());
@@ -114,94 +114,60 @@ public abstract class Message {
     }
 
     public abstract static class User<UU> extends Flat<User,UU> {
-        { header += 0; }
-
-        // called by user loop
-        public void get(Orator orator) {
-            buffer.position( mark );
-            buffer.limit( mark + idOffset );
-            nest.kelly.assertUpstream(this instanceof TaskReply);
-            if (this instanceof TaskReply)
-                payload = (UU) orator.kryo2().get( buffer() ); // user up
-            else 
-                payload = (UU) nest.kelly.kryo().get( buffer() ); // user down
-        }
-        public void handle(Orator orator,ByteBuffer buf,int limit,boolean copy) {
-            super.handle( orator, buf, limit, copy );
-            orator.boss.userq.offer( (User) this);
-        }
-        // run by user loop, ie after being recieved
-        public abstract void exec(Orator orator,Orator.Logable logger);
-    }
-
-    public static abstract class TaskBase<TT> extends User<TT> {
         { header += 4; }
         /** id used to identify a reply message, non-zero --> send a reply */
         public int msgID;
 
+        public void get(Example.MyKryo kryo) {
+            buffer.position( mark );
+            buffer.limit( mark + idOffset );
+            payload = (UU) kryo.get( buffer() );
+        }
         public void read(ByteBuffer buf) { super.read( buf ); msgID = buf.getInt(); }
         public void writeTT(ByteBuffer buf) { super.writeTT( buf ); buf.putInt( msgID ); }
+
+        public TaskReply reply(Object obj) {
+            // assert user
+            nest.kelly.assertUpstream(false);
+            Message.TaskReply rep = new Message.TaskReply();
+            rep.set(obj);
+            rep.nest = nest;
+            rep.msgID = msgID;
+            return rep;
+        }
     }
 
-    // created on upstream, sent to downstream
-    public static class Task extends TaskBase<Taskable> {
+    public static class Task<TT> extends User<Taskable<TT>> {
         { header += 0; }
 
-        public Task() {}
-        
-        /** add a callback to the message for the reply - calling more than once will "leak" the callback */
-        public Task setCallback(Orator orator,Orator.Callback cb) {
-            msgID = orator.send.msgID++;
-            orator.send.callbackMap.put( msgID, cb );
-            return this;
-        }
-
-        public void exec(Orator orator,Orator.Logable logger) {
-            Orator.Scoper scoper = new Orator.Scoper().set( orator, this, logger );
-            Object obj = payload.task( scoper );
-            if (msgID != 0) {
-                // assert user
-                nest.kelly.assertUpstream(false);
-                Message.TaskReply rep = new Message.TaskReply();
-                Output buf = new Output(new byte[2048]);
-                rep.set( obj, buf, nest.kelly.kryo() ); // user down
-                rep.nest = nest;
-                rep.msgID = msgID;
-                orator.send.sendq.offer( rep );
-            }
+        public void handle(Orator orator,ByteBuffer buf,int limit,boolean copy) {
+            super.handle(orator, buf, limit, copy);
+            orator.new MetaActor(this).start();
+            // fixme - need to send backpressure to client, tell them task has been rejected
         }
     }
     // created on downstream, sent to upstream
-    public static class TaskReply extends TaskBase {
+    public static class TaskReply extends User {
         { header += 0; }
 
-        public void exec(Orator orator,Orator.Logable logger) {
-            // upstream
-            Orator.Scoper xx = new Orator.Scoper().set( orator, this, logger );
-            Orator.Callback callback = orator.send.callbackMap.get( msgID );
-            callback.callback( payload, xx );
+        public void handle(Orator orator,ByteBuffer buf,int limit,boolean copy) {
+            super.handle( orator, buf, limit, copy );
+            boolean ok = orator.replyActor.tasks.putnb(this);
+            // fixme - need to send backpressure to client, tell them task has been rejected
         }
     }
 
-    public static class Printer extends User<Object> {
-        { header += 0; }
-        public void exec(Orator orator,Orator.Logable logger) {
-            System.out.println( "Printer: " + payload );
-        }
-    }
-
-    public static class Memo extends Flat<Memo,Adminable> {
+    public static class Memo extends Flat<Memo,Admin> {
         { header += 0; }
 
-        public void get(Orator orator) {
-            orator.boss.check();
+        public void get(Example.MyKryo kryo) {
             buffer.position( mark );
             buffer.limit( mark + idOffset );
-            payload = (Adminable) orator.boss.kryo.get(buffer()); // boss loop, up+down
+            payload = (Admin) kryo.get(buffer());
         }
         public void handle(Orator orator,ByteBuffer buf,int limit,boolean copy) {
             super.handle( orator, buf, limit, copy );
-            orator.boss.defineq.offer( this );
+            orator.memos.putb((Memo) this);
         }
     }
 
@@ -229,12 +195,11 @@ public abstract class Message {
         public void handle(Orator orator,ByteBuffer buf,int limit,boolean copy) {
             read( buf );
             SupidKey key = new SupidKey( nest.roa, supID );
-            OratorUtils.MultiBuffer mb = orator.recv.multiMap.get( key );
+            OratorUtils.MultiBuffer mb = orator.multiMap.get( key );
             boolean ready = mb.add( buf, offset, limit - buf.position(), total );
-            orator.logger.log( "Multi,%d -- %d of %d", nest.kelly.id, mb.sum, mb.total );
             if (ready) {
-                orator.recv.multiMap.map.remove( key );
-                orator.recv.handle( mb.getBuffer(), nest, true );
+                orator.multiMap.map.remove( key );
+                orator.handle( mb.getBuffer(), nest, true );
             }
         }
         public String txt() { return String.format( "%s -- %s/%d-%d of %d", super.txt(), msg.txt(), offset, offset+core-1, total ); }
@@ -265,9 +230,6 @@ public abstract class Message {
             buf.put( sup.data, offset, core );
         }
         public void read(ByteBuffer buf) { super.read(buf); offset = buf.getInt(); }
-        public void handle(Orator orator,ByteBuffer buf,int limit,boolean copy) {
-            super.handle( orator, buf, limit, copy );
-        }
     }
 
 
@@ -288,10 +250,13 @@ public abstract class Message {
             buf.putInt( packetID );
             buf.putInt( oldestID );
         }
-        public void handle(Orator orator, ByteBuffer buf, int limit, boolean copy) {
+        public void handle(Orator up,ByteBuffer buf,int limit,boolean copy) {
+            read(buf);
+            up.ack( nest, packetID, oldestID );
+        }
+        public void read(ByteBuffer buf) {
             packetID = buf.getInt();
             oldestID = buf.getInt();
-            orator.ack( nest, packetID, oldestID );
         }
     }
 
@@ -319,9 +284,7 @@ public abstract class Message {
                 len = buf.getInt();
                 pos = buf.position();
                 int subtype = buf.getInt();
-                Message msg = orator.mutils.alloc( subtype );
-                msg.nest = nest;
-                msg.handle( orator, buf, pos+len, false );
+                orator.handle(buf,nest,pos+len,subtype);
             }
         }
         public String txt() {
@@ -332,11 +295,19 @@ public abstract class Message {
             return ret;
         }
     }
+    public static class MessageUtils {
+        public DynArray.Objects<Class<Message>> list = new DynArray.Objects().init( Class.class );
+        public HashMap<Class<? extends Message>,Integer> map = new HashMap();
 
-    public static void main(String [] args) throws Exception {
-        Orator.main( "net" );
-//        new Orator().init( Orator.defaultPort ).start();
+        public Message alloc(int type) {
+            try { return list.get( type ).newInstance(); }
+            catch (Exception ex) { throw new RuntimeException( "Unable to create Message", ex ); }
+        }
+        public void add(Class<Message> klass) { int typeID = list.add( klass ); map.put( klass, typeID ); }
+        public Message prep(Message msg) { msg.type = map.get( msg.getClass() ); return msg; }
+        public MessageUtils init(Class [] array) { for (Class klass : array) add( klass ); return this; }
     }
+
 
 
 }

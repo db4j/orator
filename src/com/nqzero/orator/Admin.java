@@ -3,11 +3,13 @@
 package com.nqzero.orator;
 
 import com.esotericsoftware.kryo.Registration;
-import com.esotericsoftware.kryo.io.Output;
-import com.nqzero.orator.Orator.Adminable;
-import com.nqzero.orator.Orator.NetClass;
+import com.nqzero.orator.OratorUtils.NetClass;
+import com.nqzero.orator.OratorUtils.Nest;
+import java.io.InputStream;
+import kilim.Pausable;
+import org.srlutils.DynArray;
 
-public abstract class Admin implements Adminable {
+public abstract class Admin {
 
     public static Class [] classList = new Class [] {
         ReqIDs.class, Reply.class, ReqCode.class, ReplyCode.class, NetClass.class, NetClass[].class, byte[].class
@@ -15,46 +17,43 @@ public abstract class Admin implements Adminable {
     public transient OratorUtils.Nest nest;
 
     /** thread-safe. scratch is used to construct the message, but no reference to it is kept */
-    public Message.Memo wrap(Output scratch,Example.MyKryo kryo) {
-        Message.Memo msg = new Message.Memo().set( this, scratch, kryo );
+    public Message.Memo wrap() {
+        Message.Memo msg = new Message.Memo().set(this);
         msg.nest = nest;
         return msg;
     }
-    /** boss loop only */
-    public void reply(Orator orator,Admin next) {
-        orator.boss.check();
-        Message msg = next.wrap( orator.boss.bb, orator.boss.kryo ); // boss up+down
-        orator.send.sendq.offer( msg );
+    public void reply(Orator kup,Admin next) throws Pausable {
+        Message msg = next.wrap();
+        kup.outbox.put(msg);
     }
-    public void nest(OratorUtils.Nest nest) { this.nest = nest; }
+    public Admin nest(OratorUtils.Nest nest) { this.nest = nest; return this; }
+    public abstract void admin(Orator kup) throws Pausable;
 
 
     // always constructed on downstream (except Reply subclass)
     public static class ReqIDs extends Admin {
         public NetClass [] klasses;
 
-        public void admin(Orator orator) {
-            orator.boss.check();
-            // boss loop, upstream
-            for (NetClass nc : klasses) {
-                Registration kryoClass = orator.kryo2().getRegistration(nc.classID);
-                nc.set( kryoClass.getType() );
-            }
-            reply( orator, new Reply().set( this ) );
+        public void admin(Orator kup) throws Pausable {
+            for (NetClass nc : klasses)
+                nc.set(kup.kryo2.getRegistration(nc.classID).getType());
+            reply(kup,new Reply().set(this));
         }
         public ReqIDs set(ReqIDs req) {
             klasses = req.klasses;
             nest = req.nest;
             return this;
         }
-        public ReqIDs set(int [] classIDs) {
-            int len = classIDs.length;
-            klasses = new NetClass [ len ];
+        public static Message make(Nest nest,DynArray.ints classIDs) {
+            ReqIDs req = new ReqIDs();
+            req.nest = nest;
+            int len = classIDs.size;
+            req.klasses = new NetClass [ len ];
             for (int ii = 0; ii < len; ii++) {
-                klasses[ ii ] = new NetClass();
-                klasses[ ii ].classID = classIDs[ ii ];
+                req.klasses[ii] = new NetClass();
+                req.klasses[ii].classID = classIDs.get(ii);
             }
-            return this;
+            return req.wrap();
         }
         public String txt() {
             String desc = getClass() + " -- ";
@@ -63,55 +62,76 @@ public abstract class Admin implements Adminable {
         }
     }
     public static class Reply extends ReqIDs {
-        public void admin(Orator orator) {
-            // boss loop, downstream
-            boolean more = false, need, anyReady = false;
+        private static int fmore=2;
+        private static int fany=1;
+        int check() {
+            boolean more = false;
+            boolean need;
+            boolean anyReady = false;
             for (int ii = 0; ii < klasses.length; ii++) {
                 NetClass nc = klasses[ ii ];
-                need = nest.kelly.checkClass( nc );
+                need = nest.kelly.registerIfReady( nc );
                 if (need) more = true;
                 else { klasses[ii] = null; anyReady = true; }
             }
-            if (more)
+            return (more?fmore:0) + (anyReady?fany:0);
+        }
+        public void admin(Orator orator) throws Pausable {
+            orator.userAdmin.tasks.put(this);
+        }
+        public void doAdmin(Orator orator) throws Pausable {
+            int check = check();
+            int more = check&fmore;
+            int anyReady = check&fany;
+            if (more > 0)
                 reply( orator, new ReqCode().set( this ) );
-            if (anyReady) orator.boss.retry( nest.kelly );
+            if (anyReady > 0)
+                orator.retry(nest.kelly);
+        }
+        public static Message.Memo make(Nest nest,NetClass [] klasses) {
+            Reply req = new Reply();
+            req.nest = nest;
+            req.klasses = klasses;
+            return req.wrap();
         }
     }
     public static class ReqCode extends ReqIDs {
-        public int msgID;
-        public ReqCode set(String ... classNames) {
-            int len = classNames.length;
-            klasses = new NetClass [ len ];
-            for (int ii = 0; ii < len; ii++) {
-                klasses[ ii ] = new NetClass();
-                klasses[ ii ].name = classNames[ ii ];
-            }
-            return this;
+        public static Message.Memo make(Nest nest,String className) {
+            ReqCode req = new ReqCode();
+            req.nest = nest;
+            NetClass nc = new NetClass();
+            nc.name = className;
+            req.klasses = new NetClass[]{nc};
+            return req.wrap();
         }
-        public void admin(Orator orator) {
-            // boss loop, upstream
-            orator.boss.check();
+
+        public void admin(Orator kup) throws Pausable {
             for (NetClass nc : klasses)
-                if (nc != null) nc.code = orator.read( nc.name, nest.kelly.loader );
-            reply( orator, new ReplyCode().set( this ) );
+                if (nc != null) nc.code = readClass(nc.name);
+            reply(kup,new ReplyCode().set(this));
         }
     }
     public static class ReplyCode extends ReqCode {
         // fixme::maybe -- this should only be exec'd in a downstream ... should i verify that here ???
-        public ReplyCode set(ReqCode req) { super.set( req ); msgID = req.msgID; return this; }
-        public void admin(Orator orator) {
-            orator.boss.check();
-            if (msgID > 0)
-                nest.kelly.loader.codeq.offer( this );
-            else 
-                for (NetClass nc : klasses)
-                    if (nc != null) nest.kelly.addCode( nc );
-            orator.boss.retry( nest.kelly );
+        public void admin(Orator kup) throws Pausable {
+            kup.handleCode(this);
         }
     }
     public static class Shutdown extends ReqIDs {
-        public void admin(Orator orator) {
-            orator.shutdown();
+        public void admin(Orator kup) throws Pausable {
+            throw new AssertionError();
         }
     }
+
+
+    static public byte [] readClass(String name) {
+        return readResource(cname(name));
+    }
+    static public byte [] readResource(String name) {
+        ClassLoader cl = Admin.class.getClassLoader();
+        InputStream in = cl.getResourceAsStream( name );
+        DynArray.bytes bytes = org.srlutils.Files.readStream( in );
+        return bytes.trim();
+    }
+    static public String cname(String name) { return name.replace( '.', '/' ) + ".class"; }
 }
